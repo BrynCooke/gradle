@@ -23,9 +23,9 @@ import org.gradle.api.artifacts.Dependency;
 import org.gradle.api.artifacts.ResolveException;
 import org.gradle.api.artifacts.dsl.DependencyHandler;
 import org.gradle.api.internal.file.FileResolver;
-import org.gradle.workers.internal.WorkerDaemonFactory;
 import org.gradle.language.scala.ScalaPlatform;
 import org.gradle.platform.base.internal.toolchain.ToolProvider;
+import org.gradle.workers.internal.WorkerDaemonFactory;
 
 import java.io.File;
 import java.util.Set;
@@ -63,9 +63,10 @@ public class DownloadingScalaToolChain implements ScalaToolChainInternal {
     public ToolProvider select(ScalaPlatform targetPlatform) {
         try {
             Configuration scalaClasspath = resolveDependency("org.scala-lang:scala-compiler:" + targetPlatform.getScalaVersion());
-            Configuration zincClasspath = resolveDependency("com.typesafe.zinc:zinc:" + DefaultScalaToolProvider.DEFAULT_ZINC_VERSION);
+            Configuration zincClasspath = resolveDependency("org.scala-sbt:zinc_2.12:" + DefaultScalaToolProvider.DEFAULT_ZINC_VERSION);
             Set<File> resolvedScalaClasspath = scalaClasspath.resolve();
             Set<File> resolvedZincClasspath = zincClasspath.resolve();
+
             return new DefaultScalaToolProvider(gradleUserHomeDir, daemonWorkingDir, workerDaemonFactory, fileResolver, resolvedScalaClasspath, resolvedZincClasspath);
 
         } catch(ResolveException resolveException) {

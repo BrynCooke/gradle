@@ -16,11 +16,10 @@
 
 package org.gradle.api.internal.tasks.scala;
 
-import com.google.common.collect.ImmutableList;
-import com.typesafe.zinc.IncOptions;
-import com.typesafe.zinc.Inputs;
+import com.google.common.collect.Iterables;
 import org.gradle.api.internal.tasks.compile.CompilationFailedException;
 import org.gradle.api.internal.tasks.compile.JavaCompilerArgumentsBuilder;
+import org.gradle.api.internal.tasks.compile.JdkTools;
 import org.gradle.api.logging.Logger;
 import org.gradle.api.logging.Logging;
 import org.gradle.api.tasks.WorkResult;
@@ -29,17 +28,32 @@ import org.gradle.internal.time.Time;
 import org.gradle.internal.time.Timer;
 import org.gradle.language.base.internal.compile.Compiler;
 import org.gradle.util.GFileUtils;
+import sbt.internal.inc.Locate;
+import sbt.internal.inc.LoggedReporter;
+import sbt.internal.inc.ScalaInstance;
+import sbt.internal.inc.ZincUtil;
+import sbt.internal.inc.javac.LocalJavaCompiler;
 import scala.Option;
+import xsbti.ArtifactInfo;
+import xsbti.T2;
+import xsbti.compile.*;
 
 import java.io.File;
+import java.io.IOException;
 import java.io.Serializable;
-import java.util.List;
+import java.net.MalformedURLException;
+import java.net.URL;
+import java.net.URLClassLoader;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Supplier;
 
 public class ZincScalaCompiler implements Compiler<ScalaJavaJointCompileSpec>, Serializable {
     private static final Logger LOGGER = Logging.getLogger(ZincScalaCompiler.class);
     private final Iterable<File> scalaClasspath;
     private Iterable<File> zincClasspath;
     private final File gradleUserHome;
+    private static final Map<File, ClassLoaders> CLASSLOADER_CACHE = new ConcurrentHashMap<>();
 
     public ZincScalaCompiler(Iterable<File> scalaClasspath, Iterable<File> zincClasspath, File gradleUserHome) {
         this.scalaClasspath = scalaClasspath;
@@ -58,27 +72,90 @@ public class ZincScalaCompiler implements Compiler<ScalaJavaJointCompileSpec>, S
         static WorkResult execute(final Iterable<File> scalaClasspath, final Iterable<File> zincClasspath, File gradleUserHome, final ScalaJavaJointCompileSpec spec) {
             LOGGER.info("Compiling with Zinc Scala compiler.");
 
+            final String userSuppliedZincDir = System.getProperty("zinc.dir");
+            if (userSuppliedZincDir != null) {
+                LOGGER.warn(ZincScalaCompilerUtil.ZINC_DIR_IGNORED_MESSAGE);
+            }
+
             final xsbti.Logger logger = new SbtLoggerAdapter();
 
             Timer timer = Time.startTimer();
-            com.typesafe.zinc.Compiler compiler = ZincScalaCompilerFactory.createParallelSafeCompiler(scalaClasspath, zincClasspath, logger, gradleUserHome);
-            LOGGER.info("Initialized Zinc Scala compiler: {}", timer.getElapsed());
 
+            IncrementalCompiler compiler = ZincCompilerUtil.defaultIncrementalCompiler();
             List<String> scalacOptions = new ZincScalaCompilerArgumentsGenerator().generate(spec);
             List<String> javacOptions = new JavaCompilerArgumentsBuilder(spec).includeClasspath(false).noEmptySourcePath().build();
-            Inputs inputs = Inputs.create(ImmutableList.copyOf(spec.getCompileClasspath()), ImmutableList.copyOf(spec.getSourceFiles()), spec.getDestinationDir(),
-                    scalacOptions, javacOptions, spec.getAnalysisFile(), spec.getAnalysisMap(), "mixed", getIncOptions(), true);
-            if (LOGGER.isDebugEnabled()) {
-                Inputs.debug(inputs, logger);
-            }
 
+            CompileOptions compileOptions = CompileOptions.create()
+                .withSources(Iterables.toArray(spec.getSourceFiles(), File.class))
+                .withClasspath(Iterables.toArray(Iterables.concat(scalaClasspath, spec.getCompileClasspath()), File.class))
+                .withScalacOptions(scalacOptions.toArray(new String[scalacOptions.size()]))
+                .withClassesDirectory(spec.getDestinationDir())
+                .withJavacOptions(javacOptions.toArray(new String[javacOptions.size()]));
+
+
+            PerClasspathEntryLookup lookup = new PerClasspathEntryLookup() {
+                @Override
+                public Optional<CompileAnalysis> analysis(File classpathEntry) {
+                    Optional<File> file = Optional.ofNullable(spec.getAnalysisMap().get(classpathEntry));
+                    return file.flatMap(f->FileAnalysisStore.getDefault(f).get()).map(s -> s.getAnalysis());
+                }
+
+                @Override
+                public DefinesClass definesClass(File classpathEntry) {
+                    return Locate.definesClass(classpathEntry);
+                }
+            };
+
+            File analysisFile = spec.getAnalysisFile();
+            AnalysisStore storePast = FileAnalysisStore.getDefault(analysisFile);
+            AnalysisStore storeNext = AnalysisStore.getCachedStore(storePast);
+
+            PreviousResult previousResult = storePast.get()
+                .map(a -> PreviousResult.of(Optional.of(a.getAnalysis()), Optional.of(a.getMiniSetup())))
+                .orElse(PreviousResult.of(Optional.empty(), Optional.empty()));
+
+            File libraryJar = findFile(ArtifactInfo.ScalaLibraryID, scalaClasspath);
+            File compilerJar = findFile(ArtifactInfo.ScalaCompilerID, zincClasspath);
+
+            ClassLoaders classLoaders = CLASSLOADER_CACHE.computeIfAbsent(libraryJar, f ->
+                new ClassLoaders(getClassLoader(scalaClasspath), getClassLoader(Collections.singleton(libraryJar))));
+            String scalaVersion = getScalaVersion(classLoaders.scalaClassLoader);
+            File[] allJars = Iterables.toArray(scalaClasspath, File.class);
+            ScalaInstance scalaInstance = new ScalaInstance(scalaVersion,
+                classLoaders.scalaClassLoader,
+                classLoaders.libraryOnlyClassLoader,
+                libraryJar,
+                compilerJar,
+                allJars,
+                Option.empty());
+
+            File bridgeJar = findFile(ZincUtil.getDefaultBridgeModule(scalaVersion).name(), zincClasspath);
+            ScalaCompiler scalaCompiler = ZincCompilerUtil.scalaCompiler(scalaInstance, bridgeJar, ClasspathOptionsUtil.auto());
+            Compilers compilers = Compilers.create(scalaCompiler, new GradleJavaTool());
+            GlobalsCache cache = CompilerCache.getDefault();
+            Setup setup = Setup.create(lookup,
+                false,
+                analysisFile,
+                cache,
+                IncOptions.of(),
+                new LoggedReporter(100, logger, p -> p),
+                Optional.empty(),
+                getExtra()
+            );
+
+            Inputs inputs = Inputs.create(compilers, compileOptions, setup, previousResult);
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER.debug(inputs.toString());
+            }
             if (spec.getScalaCompileOptions().isForce()) {
                 GFileUtils.deleteDirectory(spec.getDestinationDir());
             }
             LOGGER.info("Prepared Zinc Scala inputs: {}", timer.getElapsed());
 
             try {
-                compiler.compile(inputs, logger);
+                CompileResult compile = compiler.compile(inputs, logger);
+                AnalysisContents contentNext = AnalysisContents.create(compile.analysis(), compile.setup());
+                storeNext.set(contentNext);
             } catch (xsbti.CompileFailed e) {
                 throw new CompilationFailedException(e);
             }
@@ -87,50 +164,94 @@ public class ZincScalaCompiler implements Compiler<ScalaJavaJointCompileSpec>, S
             return WorkResults.didWork(true);
         }
 
-        private static IncOptions getIncOptions() {
-            //The values are based on what I have found in sbt-compiler-maven-plugin.googlecode.com and zinc documentation
-            //Hard to say what effect they have on the incremental build
-            int transitiveStep = 3;
-            double recompileAllFraction = 0.5d;
-            boolean relationsDebug = false;
-            boolean apiDebug = false;
-            int apiDiffContextSize = 5;
-            Option<File> apiDumpDirectory = Option.empty();
-            boolean transactional = false;
-            Option<File> backup = Option.empty();
+        @SuppressWarnings({"unchecked", "rawtypes"})
+        private static T2<String, String>[] getExtra() {
+            return new T2[0];
+        }
 
-            // We need to use the deprecated constructor as it is compatible with certain previous versions of the Zinc compiler
-            @SuppressWarnings("deprecation")
-            IncOptions options = new IncOptions(transitiveStep, recompileAllFraction, relationsDebug, apiDebug, apiDiffContextSize, apiDumpDirectory, transactional, backup);
-            return options;
+        private static String getScalaVersion(ClassLoader scalaClassLoader) {
+            try {
+                Properties props = new Properties();
+                props.load(scalaClassLoader.getResource("library.properties").openStream());
+                return props.getProperty("version.number");
+            } catch (IOException e) {
+                throw new IllegalStateException("Unable to determin scala version");
+            }
+
+        }
+
+        private static File findFile(String id, Iterable<File> files) {
+            try {
+                return Iterables.find(files, f -> f.getName().contains(id));
+            } catch (NoSuchElementException e) {
+                throw new IllegalStateException("Cannot find " + id + " in " + files);
+            }
+
+        }
+
+        private static ClassLoader getClassLoader(Iterable<File> classpath) {
+
+            try {
+                List<URL> urls = new ArrayList<>();
+                for (File file : classpath) {
+                    urls.add(file.toURI().toURL());
+                }
+                return new URLClassLoader(urls.toArray(new URL[urls.size()]));
+            } catch (MalformedURLException e) {
+                throw new IllegalStateException(e);
+            }
         }
 
     }
 
+    private static class ClassLoaders {
+        ClassLoader scalaClassLoader;
+        ClassLoader libraryOnlyClassLoader;
+
+        public ClassLoaders(ClassLoader scalaClassLoader, ClassLoader libraryOnlyClassLoader) {
+            this.scalaClassLoader = scalaClassLoader;
+            this.libraryOnlyClassLoader = libraryOnlyClassLoader;
+        }
+    }
+
+    private static class GradleJavaTool implements JavaTools {
+
+        @Override
+        public JavaCompiler javac() {
+
+            return new LocalJavaCompiler(JdkTools.current().getSystemJavaCompiler());
+        }
+
+        @Override
+        public Javadoc javadoc() {
+            throw new UnsupportedOperationException();
+        }
+    }
+
     private static class SbtLoggerAdapter implements xsbti.Logger {
         @Override
-        public void error(xsbti.F0<String> msg) {
-            LOGGER.error(msg.apply());
+        public void error(Supplier<String> msg) {
+            LOGGER.error(msg.get());
         }
 
         @Override
-        public void warn(xsbti.F0<String> msg) {
-            LOGGER.warn(msg.apply());
+        public void warn(Supplier<String> msg) {
+            LOGGER.warn(msg.get());
         }
 
         @Override
-        public void info(xsbti.F0<String> msg) {
-            LOGGER.info(msg.apply());
+        public void info(Supplier<String> msg) {
+            LOGGER.info(msg.get());
         }
 
         @Override
-        public void debug(xsbti.F0<String> msg) {
-            LOGGER.debug(msg.apply());
+        public void debug(Supplier<String> msg) {
+            LOGGER.debug(msg.get());
         }
 
         @Override
-        public void trace(xsbti.F0<Throwable> exception) {
-            LOGGER.trace(exception.apply().toString());
+        public void trace(Supplier<Throwable> exception) {
+            LOGGER.trace(exception.get().toString());
         }
     }
 }

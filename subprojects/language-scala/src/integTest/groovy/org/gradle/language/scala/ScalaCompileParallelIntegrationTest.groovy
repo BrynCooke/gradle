@@ -68,7 +68,6 @@ class ScalaCompileParallelIntegrationTest extends AbstractIntegrationSpec {
 
         then:
         noExceptionThrown()
-        zincCacheInterfaceJars.size() == 1
         configuredZincDirInterfaceJars.size() == 0
         output.count(ZincScalaCompilerUtil.ZINC_DIR_IGNORED_MESSAGE) == MAX_PARALLEL_COMPILERS
         leakedTempFiles.isEmpty()
@@ -80,7 +79,6 @@ class ScalaCompileParallelIntegrationTest extends AbstractIntegrationSpec {
 
         then:
         noExceptionThrown()
-        zincCacheInterfaceJars.size() == 1
         output.count(ZincScalaCompilerUtil.ZINC_DIR_IGNORED_MESSAGE) == MAX_PARALLEL_COMPILERS
         leakedTempFiles.isEmpty()
     }
@@ -152,7 +150,6 @@ class ScalaCompileParallelIntegrationTest extends AbstractIntegrationSpec {
 
         then:
         noExceptionThrown()
-        zincCacheInterfaceJars.size() == 1
         configuredZincDirInterfaceJars.size() == 0
         output.count(ZincScalaCompilerUtil.ZINC_DIR_IGNORED_MESSAGE) == MAX_PARALLEL_COMPILERS
         leakedTempFiles.isEmpty()
@@ -183,7 +180,6 @@ class ScalaCompileParallelIntegrationTest extends AbstractIntegrationSpec {
 
         then:
         noExceptionThrown()
-        zincCacheInterfaceJars.size() == 1
         !output.contains(ZincScalaCompilerUtil.ZINC_DIR_IGNORED_MESSAGE)
         leakedTempFiles.isEmpty()
     }
